@@ -32,7 +32,8 @@ class JumpDetector:
         self.min_air_time = min_air_time  # 最小滞空時間（0.2秒 = 200ms）
 
         # 履歴データ
-        self.height_history = deque(maxlen=30)  # 過去30フレームの高さ
+        self.height_history = deque(maxlen=30)  # 過去30フレームの高さ（深度Z、後方互換性のため残す）
+        self.vertical_history = deque(maxlen=30)  # 過去30フレームの垂直位置（Y座標、RealSense座標系では下が正）
         self.position_history = deque(maxlen=30)  # 過去30フレームの位置
         self.left_foot_on_floor = deque(maxlen=5)  # 左足が床についているか
         self.right_foot_on_floor = deque(maxlen=5)  # 右足が床についているか
@@ -64,11 +65,23 @@ class JumpDetector:
         self.jump_max_height = 0.0
         self.jump_max_distance = 0.0
 
+        # レガシーモード用: Y座標ベースの高さ追跡
+        self._jump_min_y = None  # ジャンプ中の最小Y値（最高点）
+        self._jump_start_y = None  # ジャンプ開始時のY値
+
         # 検出されたジャンプのリスト
         self.detected_jumps = []
 
         # 軌跡データ
         self.trajectory = []
+
+        # クールダウン: 着地後の誤検出防止
+        self._cooldown_frames = 0
+        self._cooldown_duration = 30  # 着地後30フレーム（約1秒@30fps）は新しいジャンプを検出しない
+
+        # 滞空中の連続フレーム数をカウント（走行中の誤検出防止）
+        self._airborne_frame_count = 0
+        self._min_airborne_frames = 10  # 最低10フレーム（約0.33秒@30fps）連続で滞空している必要がある
 
     def update(self, frame_num, keypoints_3d, timestamp=None):
         """
@@ -159,9 +172,10 @@ class JumpDetector:
             # 足首が「床に近い」状態を判定（基準値から一定範囲内）
             # 立位時は足首が基準値付近にあるはず
             if self.baseline_ankle_height is not None and avg_ankle_height is not None:
-                # 基準値から5cm以内なら「床に近い（立位）」と判定
-                left_on_floor = abs(left_ankle_height - self.baseline_ankle_height) <= 0.05 if left_ankle_height is not None else False
-                right_on_floor = abs(right_ankle_height - self.baseline_ankle_height) <= 0.05 if right_ankle_height is not None else False
+                # 基準値から8cm以内なら「床に近い（立位）」と判定（5cm→8cmに緩和、水平移動時の振動を許容）
+                floor_threshold = 0.08
+                left_on_floor = abs(left_ankle_height - self.baseline_ankle_height) <= floor_threshold if left_ankle_height is not None else False
+                right_on_floor = abs(right_ankle_height - self.baseline_ankle_height) <= floor_threshold if right_ankle_height is not None else False
                 both_feet_on_floor = left_on_floor and right_on_floor
             else:
                 left_on_floor = False
@@ -176,7 +190,8 @@ class JumpDetector:
             self.use_floor_detection = False
 
         # 履歴を更新
-        self.height_history.append(z)
+        self.height_history.append(z)  # 深度（後方互換性のため残す）
+        self.vertical_history.append(y)  # 垂直位置（RealSense座標系では下が正、上にジャンプするとYが減少）
         self.position_history.append((x, y, z))
 
         # 床からの距離をすべてのキーポイントについて計算
@@ -219,8 +234,12 @@ class JumpDetector:
         return result
 
     def _detect_jump(self, frame_num, x, y, z, timestamp):
-        """ジャンプ検出ロジック"""
-        if len(self.height_history) < self.min_frames:
+        """ジャンプ検出ロジック（従来モード）"""
+        # クールダウン中はカウンタを減らす
+        if self._cooldown_frames > 0:
+            self._cooldown_frames -= 1
+
+        if len(self.vertical_history) < self.min_frames:
             return {
                 "state": "initializing",
                 "frame": frame_num,
@@ -229,17 +248,19 @@ class JumpDetector:
                 "position": (x, y, z)
             }
 
-        # 現在の高さと過去の平均高さを比較
-        current_height = z
-        avg_height = np.mean(list(self.height_history)[-self.min_frames:-1])
+        # 現在の垂直位置と過去の平均を比較
+        # RealSense座標系: Y軸は下向きが正なので、上にジャンプするとYが減少
+        current_vertical = y  # 垂直位置（Y座標）
+        avg_vertical = np.mean(list(self.vertical_history)[-self.min_frames:-1])
 
-        # 高さの変化
-        height_change = current_height - avg_height
+        # 垂直方向の変化（負の値 = 上昇、正の値 = 下降）
+        # 表示用に反転: 正の値 = 上昇（ジャンプ）、負の値 = 下降（着地）
+        vertical_change = -(current_vertical - avg_vertical)
 
-        # 水平位置の変化（前フレームと比較）
+        # 水平位置の変化（前フレームと比較）- XZ平面での距離
         if len(self.position_history) >= 2:
             prev_pos = self.position_history[-2]
-            horizontal_distance = np.sqrt((x - prev_pos[0])**2 + (y - prev_pos[1])**2)
+            horizontal_distance = np.sqrt((x - prev_pos[0])**2 + (z - prev_pos[2])**2)
         else:
             horizontal_distance = 0.0
 
@@ -248,7 +269,7 @@ class JumpDetector:
             "timestamp": timestamp,
             "height": z,
             "position": (x, y, z),
-            "height_change": height_change,
+            "vertical_change": vertical_change,  # 垂直方向の変化（正=上昇）
             "horizontal_distance": horizontal_distance,
             "jump_type": None,
             "jump_height": 0.0,
@@ -257,19 +278,32 @@ class JumpDetector:
 
         # ジャンプ状態の遷移
         if self.jump_state == "ground":
-            # 地面からジャンプ開始を検出
-            if height_change > self.threshold_vertical:
+            # クールダウン中は新しいジャンプを検出しない
+            if self._cooldown_frames > 0:
+                result["state"] = "cooldown"
+                return result
+
+            # 地面からジャンプ開始を検出（垂直方向の上昇を検出）
+            if vertical_change > self.threshold_vertical:
                 self.jump_state = "jumping"
                 self.jump_start_frame = frame_num
+                self.jump_start_timestamp = timestamp
                 self.jump_start_position = (x, y, z)
-                self.jump_max_height = current_height
+                # 最小Y値を追跡（RealSense座標系ではYが小さいほど高い位置）
+                self._jump_min_y = y  # ジャンプ中の最小Y値（最高点）
+                self._jump_start_y = y  # ジャンプ開始時のY値
                 self.jump_max_distance = 0.0
+                self._airborne_frame_count = 0
                 result["state"] = "jump_start"
 
         elif self.jump_state == "jumping":
-            # ジャンプ中の最大高さ・距離を更新
-            if current_height > self.jump_max_height:
-                self.jump_max_height = current_height
+            # 滞空フレーム数をカウント
+            self._airborne_frame_count += 1
+
+            # ジャンプ中の最高点（最小Y値）を更新
+            # RealSense座標系: Y軸は下向きが正なので、Yが小さいほど高い位置
+            if y < self._jump_min_y:
+                self._jump_min_y = y
 
             # 水平距離を更新（XZ平面での距離）
             # RealSense座標系: X=左右, Y=上下（垂直）, Z=前後（深度）
@@ -281,20 +315,66 @@ class JumpDetector:
                 if jump_distance > self.jump_max_distance:
                     self.jump_max_distance = jump_distance
 
-            # 着地を検出（高さが減少し、元の高さに戻る）
-            if height_change < -self.threshold_vertical and current_height <= avg_height + 0.02:
+            # 着地を検出（垂直方向が下降し、元の高さに戻る）
+            # vertical_change < 0 は下降を意味し、現在のYが開始時のY付近に戻ったら着地
+            if vertical_change < -self.threshold_vertical and current_vertical >= avg_vertical - 0.02:
+                # 最低滞空フレーム数をチェック
+                if self._airborne_frame_count < self._min_airborne_frames:
+                    print(f"  Skipping short airborne (legacy): {self._airborne_frame_count} frames (min={self._min_airborne_frames})")
+                    self.jump_state = "ground"
+                    self.jump_start_frame = None
+                    self.jump_start_position = None
+                    self._cooldown_frames = self._cooldown_duration // 2
+                    result["state"] = "ground"
+                    return result
+
                 self.jump_state = "landed"
+                self.jump_end_frame = frame_num
+                self.jump_end_timestamp = timestamp
                 result["state"] = "jump_end"
+
+                # ジャンプ高さを計算（Y座標の差、RealSense座標系では上がマイナスなので反転）
+                # 開始時のY - 最小Y（最高点）= ジャンプ高さ
+                jump_height = self._jump_start_y - self._jump_min_y
+
+                # 滞空時間を計算
+                air_time = 0.0
+                if self.jump_start_timestamp is not None and self.jump_end_timestamp is not None:
+                    timestamp_diff = abs(self.jump_end_timestamp - self.jump_start_timestamp)
+                    if self.jump_start_timestamp > 1000000000:
+                        air_time = timestamp_diff / 1000.0
+                    else:
+                        air_time = timestamp_diff
+                    if air_time > 10.0:
+                        air_time = self._airborne_frame_count / 30.0
+
+                # 有効性チェック
+                is_valid_jump = (
+                    abs(jump_height) >= self.min_jump_height and
+                    air_time >= self.min_air_time
+                )
+
+                if not is_valid_jump:
+                    print(f"  Skipping invalid jump (legacy): height={abs(jump_height)*100:.1f}cm (min={self.min_jump_height*100:.1f}cm), "
+                          f"air_time={air_time*1000:.1f}ms (min={self.min_air_time*1000:.1f}ms)")
+                    self.jump_state = "ground"
+                    self.jump_start_frame = None
+                    self.jump_start_position = None
+                    self._cooldown_frames = self._cooldown_duration
+                    result["state"] = "ground"
+                    return result
 
                 # ジャンプの種類を判定
                 if self.jump_max_distance < self.threshold_horizontal:
                     result["jump_type"] = "vertical"
-                    result["jump_height"] = self.jump_max_height - self.jump_start_position[2]
+                    result["jump_height"] = jump_height
                     result["jump_distance"] = 0.0
                 else:
                     result["jump_type"] = "horizontal"
-                    result["jump_height"] = self.jump_max_height - self.jump_start_position[2]
+                    result["jump_height"] = jump_height
                     result["jump_distance"] = self.jump_max_distance
+
+                result["air_time"] = air_time
 
                 # 検出されたジャンプを記録
                 jump_data = {
@@ -303,7 +383,9 @@ class JumpDetector:
                     "jump_type": result["jump_type"],
                     "height": result["jump_height"],
                     "distance": result["jump_distance"],
-                    "max_height": self.jump_max_height,
+                    "air_time": air_time,
+                    "max_height_y": self._jump_min_y,  # 最高点のY座標（最小Y値）
+                    "start_y": self._jump_start_y,  # 開始時のY座標
                     "start_position": self.jump_start_position,
                     "end_position": (x, y, z)
                 }
@@ -313,17 +395,23 @@ class JumpDetector:
                 self.jump_state = "ground"
                 self.jump_start_frame = None
                 self.jump_start_position = None
+                self._cooldown_frames = self._cooldown_duration
+                self._airborne_frame_count = 0
 
         elif self.jump_state == "landed":
             # 着地後、少し待ってから地面状態に戻る
-            if abs(height_change) < 0.01:
+            if abs(vertical_change) < 0.01:
                 self.jump_state = "ground"
                 result["state"] = "ground"
 
         # ジャンプ中の場合の情報を追加
         if self.jump_state == "jumping":
             result["state"] = "jumping"
-            result["jump_height"] = self.jump_max_height - (self.jump_start_position[2] if self.jump_start_position else avg_height)
+            # 現在のジャンプ高さ（開始Y - 現在の最小Y）
+            if hasattr(self, '_jump_start_y') and hasattr(self, '_jump_min_y'):
+                result["jump_height"] = self._jump_start_y - self._jump_min_y
+            else:
+                result["jump_height"] = 0.0
             result["jump_distance"] = self.jump_max_distance
 
         return result
@@ -332,7 +420,7 @@ class JumpDetector:
         """
         床検出ベースのジャンプ検出ロジック
         両足首の高さ変化を基準に正確なジャンプ開始・終了・滞空時間を検出
-        
+
         Args:
             frame_num: フレーム番号
             x, y, z: 参照点（腰）の3D座標
@@ -341,6 +429,10 @@ class JumpDetector:
             right_ankle: 右足首の3D座標
             avg_ankle_height: 両足首の平均高さ（床からの距離、メートル）
         """
+        # クールダウン中はカウンタを減らす
+        if self._cooldown_frames > 0:
+            self._cooldown_frames -= 1
+
         if len(self.height_history) < self.min_frames:
             return {
                 "state": "initializing",
@@ -423,21 +515,24 @@ class JumpDetector:
                 if len(self.height_history) >= 5:
                     self._initial_state = False
             
-            # 離陸検出（初期状態ではない場合のみ）
+            # 離陸検出（初期状態ではない場合、かつクールダウン中でない場合のみ）
             # 足首の高さ変化ベースの離陸検出
             # 基準足首高さから上昇した場合に離陸と判定
-            if not self._initial_state:
+            if not self._initial_state and self._cooldown_frames == 0:
                 # 足首の高さが基準値から上昇したかチェック
                 ankle_height_increased = False
                 if self.baseline_ankle_height is not None and avg_ankle_height is not None:
-                    # 基準値から5cm以上上昇したら離陸
-                    if avg_ankle_height > self.baseline_ankle_height + 0.05:
+                    # 基準値から8cm以上上昇したら離陸（5cm→8cmに増加、水平移動時の振動対策）
+                    takeoff_threshold = 0.08
+                    if avg_ankle_height > self.baseline_ankle_height + takeoff_threshold:
                         ankle_height_increased = True
-                    # または過去数フレームで上昇傾向
-                    elif len(self.ankle_height_history) >= 3:
-                        recent_heights = list(self.ankle_height_history)[-3:]
+                    # または過去5フレームで一貫して上昇傾向（3→5フレームに増加）
+                    elif len(self.ankle_height_history) >= 5:
+                        recent_heights = list(self.ankle_height_history)[-5:]
                         avg_recent = sum(recent_heights) / len(recent_heights)
-                        if avg_recent > self.baseline_ankle_height + 0.05:
+                        # 全フレームが閾値を超えているかチェック（より厳密な判定）
+                        all_above_threshold = all(h > self.baseline_ankle_height + takeoff_threshold for h in recent_heights)
+                        if all_above_threshold and avg_recent > self.baseline_ankle_height + takeoff_threshold:
                             ankle_height_increased = True
                 
                 # 足首の高さが上昇した場合に離陸と判定
@@ -450,7 +545,10 @@ class JumpDetector:
                             if kp_coords and kp_coords[0] is not None and kp_coords[1] is not None and kp_coords[2] is not None:
                                 takeoff_distances[kp_name] = self.floor_detector.distance_to_floor(kp_coords)
                     self.takeoff_transitions.append((frame_num, takeoff_distances))
-                    
+
+                    # 滞空フレームカウンターを初期化
+                    self._airborne_frame_count = 0
+
                     self.jump_state = "takeoff"
                     self.jump_takeoff_frame = frame_num
                     self.jump_takeoff_timestamp = timestamp
@@ -475,7 +573,7 @@ class JumpDetector:
                 # 床検出が使えない場合はZ座標で計算
                 if z > self.jump_max_height:
                     self.jump_max_height = z
-            
+
             # 水平距離を更新（開始位置から、XZ平面での距離）
             # RealSense座標系: X=左右, Y=上下（垂直）, Z=前後（深度）
             # 水平距離はXZ平面での距離であるべき
@@ -486,7 +584,11 @@ class JumpDetector:
                 )
                 if jump_distance > self.jump_max_distance:
                     self.jump_max_distance = jump_distance
-            
+
+            # 滞空フレーム数をカウント開始
+            if both_feet_off_floor:
+                self._airborne_frame_count += 1
+
             # 浮上中状態に移行
             self.jump_state = "airborne"
             result["state"] = "jumping"
@@ -507,7 +609,7 @@ class JumpDetector:
                 # 床検出が使えない場合はZ座標で計算
                 if z > self.jump_max_height:
                     self.jump_max_height = z
-            
+
             # 水平距離を更新（XZ平面での距離）
             # RealSense座標系: X=左右, Y=上下（垂直）, Z=前後（深度）
             if self.jump_start_position:
@@ -517,23 +619,44 @@ class JumpDetector:
                 )
                 if jump_distance > self.jump_max_distance:
                     self.jump_max_distance = jump_distance
-            
+
+            # 滞空フレーム数をカウント
+            if both_feet_off_floor:
+                self._airborne_frame_count += 1
+
             # 着地検出: 両足が床に着地
             if both_feet_stable_on_floor:
-                # 着地時の全キーポイントの距離を記録
-                landing_distances = {}
-                if self.use_floor_detection and self.floor_detector:
-                    for kp_name, kp_coords in keypoints_3d.items():
-                        if kp_coords and kp_coords[0] is not None and kp_coords[1] is not None and kp_coords[2] is not None:
-                            landing_distances[kp_name] = self.floor_detector.distance_to_floor(kp_coords)
-                self.landing_transitions.append((frame_num, landing_distances))
-                
-                self.jump_state = "landing"
-                self.jump_end_frame = frame_num
-                self.jump_end_timestamp = timestamp
-                self.jump_end_position = (x, y, z)
-                result["state"] = "jump_end"
-            
+                # 最低滞空フレーム数をチェック（走行中の誤検出防止）
+                if self._airborne_frame_count >= self._min_airborne_frames:
+                    # 着地時の全キーポイントの距離を記録
+                    landing_distances = {}
+                    if self.use_floor_detection and self.floor_detector:
+                        for kp_name, kp_coords in keypoints_3d.items():
+                            if kp_coords and kp_coords[0] is not None and kp_coords[1] is not None and kp_coords[2] is not None:
+                                landing_distances[kp_name] = self.floor_detector.distance_to_floor(kp_coords)
+                    self.landing_transitions.append((frame_num, landing_distances))
+
+                    self.jump_state = "landing"
+                    self.jump_end_frame = frame_num
+                    self.jump_end_timestamp = timestamp
+                    self.jump_end_position = (x, y, z)
+                    result["state"] = "jump_end"
+                else:
+                    # 滞空時間が短すぎる（走行中のステップ）→ジャンプとしてカウントしない
+                    print(f"  Skipping short airborne: {self._airborne_frame_count} frames (min={self._min_airborne_frames})")
+                    # 状態をリセット
+                    self.jump_state = "ground"
+                    self.jump_start_frame = None
+                    self.jump_start_position = None
+                    self.jump_takeoff_frame = None
+                    self.jump_takeoff_position = None
+                    self.jump_max_height = 0.0
+                    self.jump_max_distance = 0.0
+                    self._airborne_frame_count = 0
+                    self._cooldown_frames = self._cooldown_duration // 2  # 短いクールダウン
+                    result["state"] = "ground"
+                    return result
+
             result["state"] = "jumping"
             # 現在の高さ・距離を記録（床からの高さ - 離陸時の高さ）
             if height_above_floor is not None and self.jump_takeoff_height is not None:
@@ -592,6 +715,7 @@ class JumpDetector:
             
             if not is_valid_jump:
                 # 無効なジャンプは記録しない（誤検出を除外）
+                # ただし、クールダウンは適用して連続誤検出を防ぐ
                 print(f"  Skipping invalid jump: height={jump_height*100:.1f}cm (min={self.min_jump_height*100:.1f}cm), "
                       f"air_time={air_time*1000:.1f}ms (min={self.min_air_time*1000:.1f}ms)")
             else:
@@ -630,11 +754,19 @@ class JumpDetector:
             self.jump_max_distance = 0.0
             self.jump_takeoff_height = None
             self._initial_state = True  # 次のジャンプ検出のために初期状態に戻す
-            
+
+            # クールダウンを開始（着地後しばらくは新しいジャンプを検出しない）
+            self._cooldown_frames = self._cooldown_duration
+            # 滞空フレームカウンターをリセット
+            self._airborne_frame_count = 0
+
             # 着地後は一定フレーム間、新しいジャンプを検出しない（誤検出を防ぐ）
             # 履歴をクリアして、安定した床接触を再確立
             self.left_foot_on_floor.clear()
             self.right_foot_on_floor.clear()
+            # 足首高さの基準値もリセット（次のジャンプのために再計算）
+            self.baseline_ankle_height = None
+            self.ankle_height_history.clear()
         
         return result
 

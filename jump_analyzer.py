@@ -33,12 +33,15 @@ import matplotlib.font_manager as fm
 try:
     # よく使われる日本語フォントを探す
     jp_fonts = [
+        "Hiragino Sans",           # macOS
+        "Hiragino Kaku Gothic Pro",  # macOS
+        "Hiragino Kaku Gothic ProN",  # macOS
         "Noto Sans CJK JP",
         "TakaoGothic",
         "IPAexGothic",
         "IPAPGothic",
         "VL PGothic",
-        "Yu Gothic",
+        "Yu Gothic",               # Windows
     ]
     for font_name in jp_fonts:
         try:
@@ -767,14 +770,28 @@ def plot_jump_trajectory(trajectory, statistics, output_dir, floor_detector=None
     fig, ax = plt.subplots(figsize=(14, 8))
 
     # Y座標を反転（RealSense座標系: 下向きが正 → 表示座標系: 上向きが正）
-    # 基準値を求める（床面の高さ = 最大Y値）
+    # 基準値を求める（床面の高さ）
     if positions_y:
         y_min = min(positions_y)
         y_max = max(positions_y)
         # RealSense座標系ではYが大きいほど下にあるので、最大Y値が床面
-        # 床検出が有効な場合は、より正確な床面の高さを使用することも可能
-        # ここでは最大Y値を床面として使用（軌跡データの中で最も低い位置）
-        y_floor = y_max  # 最大Y値を床面の基準とする（RealSense座標系では下が正）
+        # ただし、max()だと時間範囲によって基準値が変わるため、
+        # より安定した基準値として以下を使用:
+        # 1. 最初の数フレーム（立位と仮定）のY値の平均
+        # 2. または全データの上位10%のY値の中央値（立位時の基準）
+
+        # 方法1: 最初の10フレームの平均（立位と仮定）
+        initial_frames = min(10, len(positions_y))
+        y_floor_initial = sum(positions_y[:initial_frames]) / initial_frames
+
+        # 方法2: 上位10%のY値（最も低い位置）の中央値
+        sorted_y = sorted(positions_y, reverse=True)  # 降順（大きい=低い位置が先）
+        top_10_percent = sorted_y[:max(1, len(sorted_y) // 10)]
+        y_floor_median = sum(top_10_percent) / len(top_10_percent)
+
+        # より大きい値（より低い位置）を床基準として使用
+        y_floor = max(y_floor_initial, y_floor_median)
+
         # Y座標を反転: 床からの距離として表示（上向きが正、0以上）
         # y_floor - y で計算: yが大きい（下）→0に近い、yが小さい（上）→大きな正の値
         heights = [y_floor - y for y in positions_y]
@@ -931,6 +948,93 @@ def plot_jump_trajectory(trajectory, statistics, output_dir, floor_detector=None
     plt.close()
     print(f"Jump trajectory (height-time) plot saved to: {trajectory_height_path}")
 
+    # 3. X座標-時間グラフ（Mid-HipのX座標）
+    fig, ax = plt.subplots(figsize=(14, 8))
+
+    # 有効なタイムスタンプとX座標のデータのみプロット
+    valid_time_x = [(t, x) for t, x in zip(timestamps, positions_x) if t is not None]
+    if valid_time_x:
+        valid_times, valid_x = zip(*valid_time_x)
+        ax.plot(
+            valid_times,
+            valid_x,
+            "b-",
+            alpha=0.5,
+            linewidth=1,
+            label="Full trajectory" if not USE_JAPANESE_LABELS else "全軌跡",
+        )
+
+        # ジャンプ中の軌跡を強調
+        if jumps:
+            for i, jump in enumerate(jumps):
+                frame_start = jump.get("frame_start")
+                frame_takeoff = jump.get("frame_takeoff", frame_start)
+                frame_end = jump.get("frame_end")
+                jump_type = jump.get("jump_type", "unknown")
+
+                if frame_start is not None and frame_end is not None:
+                    jump_times = []
+                    jump_x = []
+
+                    for j, f in enumerate(frames):
+                        if f is not None and frame_start <= f <= frame_end:
+                            if timestamps[j] is not None:
+                                jump_times.append(timestamps[j])
+                                jump_x.append(positions_x[j])
+
+                    if jump_times:
+                        color = colors(i % 10)
+                        jump_label = f"Jump {i+1} ({jump_type})"
+                        ax.plot(
+                            jump_times,
+                            jump_x,
+                            color=color,
+                            linewidth=2.5,
+                            label=jump_label,
+                            alpha=0.9,
+                        )
+
+                        # 離陸点と着地点をマーク
+                        if len(jump_times) > 0:
+                            ax.scatter(
+                                [jump_times[0]],
+                                [jump_x[0]],
+                                color=color,
+                                s=100,
+                                marker="^",
+                                zorder=5,
+                                edgecolors="black",
+                                linewidths=1,
+                            )
+                            ax.scatter(
+                                [jump_times[-1]],
+                                [jump_x[-1]],
+                                color=color,
+                                s=100,
+                                marker="v",
+                                zorder=5,
+                                edgecolors="black",
+                                linewidths=1,
+                            )
+
+    if USE_JAPANESE_LABELS:
+        ax.set_xlabel("時間 (秒)", fontsize=12, fontweight="bold")
+        ax.set_ylabel("X座標 (m) - 左右方向", fontsize=12, fontweight="bold")
+        ax.set_title("腰の中点 X座標（時系列）", fontsize=14, fontweight="bold")
+    else:
+        ax.set_xlabel("Time (seconds)", fontsize=12, fontweight="bold")
+        ax.set_ylabel("X coordinate (m) - Left/Right", fontsize=12, fontweight="bold")
+        ax.set_title("Mid-Hip X Coordinate (Time Series)", fontsize=14, fontweight="bold")
+
+    ax.grid(True, alpha=0.3, linestyle="--")
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1), fontsize=10, framealpha=0.9)
+    plt.tight_layout()
+
+    trajectory_x_path = output_dir / "jump_trajectory_x.png"
+    plt.savefig(str(trajectory_x_path), dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"Jump trajectory (X-time) plot saved to: {trajectory_x_path}")
+
 
 def load_config(config_path):
     """
@@ -975,6 +1079,16 @@ def merge_config_with_args(config, args):
 
     # 設定ファイルの値をデフォルトとして使用（コマンドライン引数が指定されていない場合）
     # 新旧両方の形式に対応（enable_* 形式を優先、後方互換性のため no_* 形式もサポート）
+
+    # filenameが指定されている場合、inputとoutputを自動生成
+    if "filename" in config and config["filename"]:
+        filename = config["filename"]
+        # inputが明示的に指定されていない場合のみ自動生成
+        if "input" not in config or not config["input"]:
+            config["input"] = f"record/{filename}.bag"
+        # outputが明示的に指定されていない場合のみ自動生成
+        if "output" not in config or not config["output"]:
+            config["output"] = f"results/{filename}"
 
     # 新しいenable_*形式をno_*形式に変換（コマンドライン引数との互換性のため）
     if "enable_video" in config:
@@ -1503,7 +1617,7 @@ Examples:
     # 可視化動画ライター（メモリ効率化のため逐次書き込み）
     video_writer = None
     video_path = None
-    video_fps = 30
+    video_fps = config.get("video_fps", 30)  # configから取得、デフォルト30fps
 
     print("\nProcessing frames...")
     if args.frame_skip > 1:

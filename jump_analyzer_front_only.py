@@ -33,12 +33,15 @@ import matplotlib.font_manager as fm
 try:
     # よく使われる日本語フォントを探す
     jp_fonts = [
+        "Hiragino Sans",           # macOS
+        "Hiragino Kaku Gothic Pro",  # macOS
+        "Hiragino Kaku Gothic ProN",  # macOS
         "Noto Sans CJK JP",
         "TakaoGothic",
         "IPAexGothic",
         "IPAPGothic",
         "VL PGothic",
-        "Yu Gothic",
+        "Yu Gothic",               # Windows
     ]
     for font_name in jp_fonts:
         try:

@@ -241,6 +241,7 @@ class YOLOv8PoseDetector:
             imgsz = min(640, max(320, (max_dim // 32) * 32))  # 32の倍数に丸める
 
             # 推論実行（CUDAエラー時はCPUにフォールバック）
+            # 複数人物を検出して右側の人物を選択するため、max_det=5に設定
             try:
                 results = self.model(
                     image_rgb,
@@ -248,7 +249,7 @@ class YOLOv8PoseDetector:
                     device=self.device,
                     half=half,  # 半精度推論（GPU/MPS使用時、約2倍高速化）
                     imgsz=imgsz,  # 動的に最適化された入力サイズ
-                    max_det=1,  # 最大検出数を1に制限（ジャンプ分析では1人のみ、高速化）
+                    max_det=5,  # 複数人物を検出（右側の人物を選択するため）
                     conf=0.25,  # 信頼度閾値（デフォルトより低めに設定して検出確率を上げる）
                 )
             except Exception as e:
@@ -264,7 +265,7 @@ class YOLOv8PoseDetector:
                         device=self.device,
                         half=False,  # CPUでは半精度推論を無効化
                         imgsz=imgsz,
-                        max_det=1,
+                        max_det=5,
                         conf=0.25,
                     )
                 else:
@@ -290,16 +291,26 @@ class YOLOv8PoseDetector:
 
             # 最初の人物のkeypointsを使用（必要に応じて最大bboxサイズの人物を選択）
             if len(keypoints_data) > 1:
-                # 複数人物の場合は、最大の信頼度を持つ人物を選択
-                # 各人物の平均信頼度を計算（NumPyベクトル演算で高速化）
-                person_confidences = np.array([
-                    np.mean(person_kpts[:, 2][person_kpts[:, 2] > 0])
-                    if np.any(person_kpts[:, 2] > 0)
-                    else 0.0
-                    for person_kpts in keypoints_data
-                ])
-                # 最大信頼度の人物を選択
-                best_person_idx = np.argmax(person_confidences)
+                # 複数人物の場合は、最も右側（X座標が大きい）の人物を選択
+                # 各人物の腰（LHip=11, RHip=12）の中点X座標を計算
+                person_x_positions = []
+                for person_kpts in keypoints_data:
+                    # LHip(11)とRHip(12)の中点を計算
+                    lhip = person_kpts[11]
+                    rhip = person_kpts[12]
+                    if lhip[2] > 0 and rhip[2] > 0:
+                        mid_x = (lhip[0] + rhip[0]) / 2
+                    elif lhip[2] > 0:
+                        mid_x = lhip[0]
+                    elif rhip[2] > 0:
+                        mid_x = rhip[0]
+                    else:
+                        # 腰が検出されない場合は全キーポイントの平均X座標を使用
+                        valid_x = person_kpts[person_kpts[:, 2] > 0, 0]
+                        mid_x = np.mean(valid_x) if len(valid_x) > 0 else 0
+                    person_x_positions.append(mid_x)
+                # 最も右側（X座標が最大）の人物を選択
+                best_person_idx = np.argmax(person_x_positions)
                 keypoints_17 = keypoints_data[best_person_idx]
             else:
                 keypoints_17 = keypoints_data[0]
