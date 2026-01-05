@@ -315,9 +315,11 @@ class JumpDetector:
                 if jump_distance > self.jump_max_distance:
                     self.jump_max_distance = jump_distance
 
-            # 着地を検出（垂直方向が下降し、元の高さに戻る）
-            # vertical_change < 0 は下降を意味し、現在のYが開始時のY付近に戻ったら着地
-            if vertical_change < -self.threshold_vertical and current_vertical >= avg_vertical - 0.02:
+            # 着地を検出（垂直方向が下降し、開始時の高さに戻る）
+            # vertical_change < 0 は下降を意味し、現在のYがジャンプ開始時のY付近に戻ったら着地
+            # 注: avg_verticalではなく_jump_start_yを使用（移動平均はジャンプ中のフレームを含むため不正確）
+            landing_threshold = 0.05  # 着地判定の許容誤差（5cm）
+            if vertical_change < -self.threshold_vertical and current_vertical >= self._jump_start_y - landing_threshold:
                 # 最低滞空フレーム数をチェック
                 if self._airborne_frame_count < self._min_airborne_frames:
                     print(f"  Skipping short airborne (legacy): {self._airborne_frame_count} frames (min={self._min_airborne_frames})")

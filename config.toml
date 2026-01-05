@@ -3,8 +3,15 @@
 # コマンドライン引数は設定ファイルの値を上書きします
 
 # 入力・出力パス
-input = "record/nakamura_suityoku_yoko.bag"  # 入力.bagファイルパス（またはディレクトリ）
-output = "results/"  # 出力ディレクトリ
+filename = "nakamura_horizon2"  # 入力ファイル名（.bagは不要）
+    # filenameを指定すると自動的にパスが生成される:
+    #   input = "record/{filename}.bag"
+    #   output = "results/{filename}"
+
+# input/outputを個別に指定する場合はfilenameをコメントアウトして以下を使用:
+# input = "record/custom.bag"
+# output = "results/custom"
+
 dual = false  # デュアルカメラモード（trueの場合、inputにディレクトリを指定すると自動で*_metadata.jsonを検出）
 
 # モデル設定
@@ -21,6 +28,7 @@ min_air_time = 0.20  # 有効なジャンプと認識する最小滞空時間（
 enable_video = true  # ビデオ出力を有効化（true: 出力する、false: スキップ）
 enable_3d_animation = true  # 3Dアニメーションを有効化（true: 生成する、false: スキップ）
 interactive_3d = true  # インタラクティブ3Dアニメーションを表示
+video_fps = 60  # 出力動画のFPS（元の録画FPSに合わせる。30または60が一般的）
 
 # キーポイントスムージング
 smooth_keypoints = true  # キーポイントスムージングを有効化（falseの場合は無効、trueの場合はsmooth_window_sizeを使用）
@@ -36,12 +44,16 @@ kalman_process_noise = 0.03  # カルマンフィルタ処理ノイズ（小さ�
 kalman_measurement_noise = 0.1  # カルマンフィルタ測定ノイズ（大きいほど予測を信頼）
 
 # 床検出（高精度なジャンプ検出）
-enable_floor_detection = true  # 床検出を有効化（true: 床検出を使用、false: 従来の高さベース検出を使用）
+# 注意: 体育館の日光反射などで深度データが破綻している場合は false に設定
+enable_floor_detection = false  # 床検出を無効化（従来の高さベース検出を使用）
 
 # 再生時間範囲（秒）
 # 0の場合は最初から/最後まで（nullは使えないので0で代用）
-start_time = 165.0  # 開始時間（秒、0の場合は最初から）
-end_time = 180.0    # 終了時間（秒、0の場合は最後まで）
+start_time = 5.0  # 開始時間（秒、0の場合は最初から）
+end_time = 51.0    # 終了時間（秒、0の場合は最後まで）
+
+# start_time = 43.0  # 開始時間（秒、0の場合は最初から）
+# end_time = 51.0    # 終了時間（秒、0の場合は最後まで）
 
 # 高速化オプション
 frame_skip = 1  # Nフレームおきに処理（1=全フレーム、2=2フレームおき、など）

@@ -570,11 +570,13 @@ def plot_jump_trajectory(trajectory, statistics, output_dir, floor_detector=None
     positions_y = []
     positions_z = []
     frames = []
+    ankle_y_values = []  # 足首のY座標を収集（床位置推定用）
 
     for point in trajectory:
         timestamp = point.get("timestamp")
         pos = point.get("position", (None, None, None))
         frame = point.get("frame")
+        keypoints = point.get("keypoints", {})
 
         if pos[0] is not None and pos[1] is not None and pos[2] is not None:
             # タイムスタンプを秒に変換（ミリ秒単位の可能性がある）
@@ -596,6 +598,14 @@ def plot_jump_trajectory(trajectory, statistics, output_dir, floor_detector=None
             positions_y.append(pos[1])  # Y軸は高さ（RealSense座標系では下が正）
             positions_z.append(pos[2])
             frames.append(frame)
+
+            # 足首のY座標を収集（床位置推定用）
+            left_ankle = keypoints.get("LAnkle")
+            right_ankle = keypoints.get("RAnkle")
+            if left_ankle and left_ankle[1] is not None:
+                ankle_y_values.append(left_ankle[1])
+            if right_ankle and right_ankle[1] is not None:
+                ankle_y_values.append(right_ankle[1])
 
     if not positions_x:
         print("Warning: No valid trajectory positions found for jump trajectory plot")
@@ -770,27 +780,22 @@ def plot_jump_trajectory(trajectory, statistics, output_dir, floor_detector=None
     fig, ax = plt.subplots(figsize=(14, 8))
 
     # Y座標を反転（RealSense座標系: 下向きが正 → 表示座標系: 上向きが正）
-    # 基準値を求める（床面の高さ）
+    # 床位置を推定（足首のY座標から）
     if positions_y:
-        y_min = min(positions_y)
-        y_max = max(positions_y)
-        # RealSense座標系ではYが大きいほど下にあるので、最大Y値が床面
-        # ただし、max()だと時間範囲によって基準値が変わるため、
-        # より安定した基準値として以下を使用:
-        # 1. 最初の数フレーム（立位と仮定）のY値の平均
-        # 2. または全データの上位10%のY値の中央値（立位時の基準）
-
-        # 方法1: 最初の10フレームの平均（立位と仮定）
-        initial_frames = min(10, len(positions_y))
-        y_floor_initial = sum(positions_y[:initial_frames]) / initial_frames
-
-        # 方法2: 上位10%のY値（最も低い位置）の中央値
-        sorted_y = sorted(positions_y, reverse=True)  # 降順（大きい=低い位置が先）
-        top_10_percent = sorted_y[:max(1, len(sorted_y) // 10)]
-        y_floor_median = sum(top_10_percent) / len(top_10_percent)
-
-        # より大きい値（より低い位置）を床基準として使用
-        y_floor = max(y_floor_initial, y_floor_median)
+        # 床位置の推定：足首のY座標の最大値（立位時の足首位置）を使用
+        # 足首は床から約5-10cm上にあるため、その値を床位置とする
+        if ankle_y_values:
+            # 足首Y値の上位10%の平均を床位置として使用（立位時のデータ）
+            sorted_ankle_y = sorted(ankle_y_values, reverse=True)  # 降順（大きい=床に近い）
+            top_10_percent_count = max(1, len(sorted_ankle_y) // 10)
+            y_floor = sum(sorted_ankle_y[:top_10_percent_count]) / top_10_percent_count
+            # 足首から床までのオフセット（約5cm）を加算
+            y_floor += 0.05
+            print(f"  Floor estimated from ankle positions: y_floor = {y_floor:.3f}m")
+        else:
+            # 足首データがない場合は腰のY座標の最大値を使用（フォールバック）
+            y_floor = max(positions_y)
+            print(f"  Floor estimated from hip positions (fallback): y_floor = {y_floor:.3f}m")
 
         # Y座標を反転: 床からの距離として表示（上向きが正、0以上）
         # y_floor - y で計算: yが大きい（下）→0に近い、yが小さい（上）→大きな正の値
